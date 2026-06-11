@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+actix-http = "3.12.1"
+actix-rt = "2.11.0"
+actix-server = "2.6.0"
+awc = "3.8.2"
+bytes = "1.11.1"
+env_logger = "0.11.10"
+futures = "0.3.32"
+futures-util = "0.3.32"
+glob = "0.3.3"
+log = "0.4.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sysinfo = "0.39.3"
+tokio = { version = "1.52.3", features = ["sync"] }
