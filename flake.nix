@@ -1,5 +1,5 @@
 {
-  description = "Anyrun search results provider";
+  description = "Resource gated LLM proxy";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -60,7 +60,7 @@
 
         in
         {
-          anyrun-provider = pkg;
+          gated-proxy = pkg;
           default = pkg;
         }
       );
