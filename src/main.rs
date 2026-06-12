@@ -165,7 +165,7 @@ async fn proxy_handler(
             .insert_header(("retry-after", "10"))
             .insert_header(("content-type", "application/json"))
             .body(
-                r#"{"error":{"message":"Resource load too high, try again later","type":"overloaded","code":"resource_exhausted"}}"#
+                r#"{"error":{"message":"Resource load too high, try again later","type":"overloaded","code":503}}"#
                     .to_string(),
             ));
     }
