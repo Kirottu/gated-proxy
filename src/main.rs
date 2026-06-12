@@ -1,17 +1,14 @@
-use std::{convert::Infallible, env, fs, io, path::PathBuf, pin::Pin, sync::Arc, time::Duration};
+use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
 
-use actix_http::{
-    BoxedPayloadStream, HttpMessage, HttpService, Request, Response, StatusCode, header::HeaderName,
-};
-use actix_server::Server;
-use awc::{Client, ResponseBody, body::BodyStream, error::HeaderValue};
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
+use awc::Client;
 use serde::Deserialize;
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, RefreshKind, System};
-use tokio::{
-    sync::{Mutex, RwLock},
-    time::Instant,
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use tokio::sync::Mutex;
+
+use actix_web::{
+    App, HttpResponse, HttpServer, error,
+    middleware::Logger,
+    web::{self, PayloadConfig},
 };
 
 #[derive(Deserialize)]
@@ -60,8 +57,8 @@ struct ResourceMonitor {
     config: Config,
     sys: System,
     refresh_kind: RefreshKind,
-    last_under_load: Option<Instant>,
-    last_model_loaded: Option<Instant>,
+    last_under_load: Option<tokio::time::Instant>,
+    last_model_loaded: Option<tokio::time::Instant>,
     vram_path: PathBuf,
     total_vram: u64,
 }
@@ -94,8 +91,6 @@ impl ResourceMonitor {
     }
 
     async fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // FIXME: Error handling
-        log::debug!("Refreshing resource monitor");
         self.sys.refresh_specifics(self.refresh_kind);
         let vram: u64 = fs::read_to_string(&self.vram_path)?.trim().parse()?;
 
@@ -103,8 +98,7 @@ impl ResourceMonitor {
         let ram_used = self.sys.used_memory() as f64 / self.sys.total_memory() as f64;
 
         if vram_used > self.config.vram_thresh || ram_used > self.config.ram_thresh {
-            log::debug!("System is currently under too much load");
-            self.last_under_load = Some(Instant::now());
+            self.last_under_load = Some(tokio::time::Instant::now());
         }
 
         let client = Client::new();
@@ -113,18 +107,17 @@ impl ResourceMonitor {
                 "http://{}:{}/v1/models",
                 self.config.target_host, self.config.target_port
             ))
+            .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
             .send()
             .await?
             .json()
             .await?;
 
-        // Check if any model is loaded or loading
         if models.data.iter().any(|model| {
             model.status.value == ModelStatusValue::Loaded
                 || model.status.value == ModelStatusValue::Loading
         }) {
-            log::debug!("A model is currently loaded");
-            self.last_model_loaded = Some(Instant::now());
+            self.last_model_loaded = Some(tokio::time::Instant::now());
         }
 
         Ok(())
@@ -133,121 +126,113 @@ impl ResourceMonitor {
     async fn api_allowed(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         self.refresh().await?;
 
-        // Allow API queries to go true if either
-        // - The system has been idling for more than the threshold period
-        // - A model has been loaded more recently than the threshold period
-        Ok(self
+        let load_allowed = self
             .last_under_load
             .map(|instant| instant.elapsed().as_secs())
             .unwrap_or(u64::MAX)
-            > self.config.idle_thresh
-            || self
-                .last_model_loaded
-                .map(|instant| instant.elapsed().as_secs())
-                .unwrap_or(u64::MAX)
-                < self.config.idle_thresh)
+            > self.config.idle_thresh;
+        let grace_allowed = self
+            .last_model_loaded
+            .map(|instant| instant.elapsed().as_secs())
+            .unwrap_or(u64::MAX)
+            < self.config.idle_thresh;
+
+        log::debug!("Load allowed: {load_allowed}, grace allowed: {grace_allowed}");
+        // Allow API queries if either:
+        // - System has been idling for more than the threshold period
+        // - A model was loaded more recently than the threshold period
+        Ok(load_allowed || grace_allowed)
     }
 }
 
-#[actix_rt::main]
+async fn proxy_handler(
+    resource_monitor: web::Data<Arc<Mutex<ResourceMonitor>>>,
+    config: web::Data<Config>,
+    req: actix_web::HttpRequest,
+    body: web::Bytes,
+) -> Result<HttpResponse, actix_web::Error> {
+    let api_allowed = match resource_monitor.lock().await.api_allowed().await {
+        Ok(val) => val,
+        Err(why) => {
+            log::error!("Resource monitor reported an error, failing open: {why}");
+            true
+        }
+    };
+
+    if !api_allowed {
+        log::info!("Proxied request disallowed due to system conditions");
+        return Ok(HttpResponse::ServiceUnavailable()
+            .insert_header(("retry-after", "10"))
+            .insert_header(("content-type", "application/json"))
+            .body(
+                r#"{"error":{"message":"Resource load too high, try again later","type":"overloaded","code":"resource_exhausted"}}"#
+                    .to_string(),
+            ));
+    }
+
+    let client = Client::new();
+    let upstream_url = format!(
+        "http://{}:{}{}",
+        config.target_host,
+        config.target_port,
+        req.uri()
+    );
+
+    match client
+        .request_from(&upstream_url, req.head())
+        .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
+        .send_body(body)
+        .await
+    {
+        Ok(upstream_res) => {
+            log::info!("Dispatching response: status={}", upstream_res.status());
+            // let stream = BodyStream::new(upstream_res.take_payload());
+            let headers = upstream_res.headers().clone();
+
+            let mut res = HttpResponse::build(upstream_res.status()).streaming(upstream_res);
+            for (name, value) in headers {
+                res.headers_mut().insert(name, value);
+            }
+            Ok(res)
+        }
+        Err(why) => {
+            log::error!("Upstream request failed: {why}");
+            Err(error::ErrorInternalServerError(why))
+        }
+    }
+}
+
+#[actix_web::main]
 async fn main() -> io::Result<()> {
     env_logger::init();
 
-    let config_path = env::var("GATED_PROXY_CONFIG").unwrap();
-    let config = serde_json::from_slice::<Config>(&fs::read(&config_path).unwrap()).unwrap();
+    let config_path =
+        std::env::var("GATED_PROXY_CONFIG").unwrap_or_else(|_| "config.json".to_string());
+    let config: Config = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
 
     let resource_monitor = Arc::new(Mutex::new(ResourceMonitor::new(config.clone())));
-    let config = Arc::new(config);
 
-    let resource_monitor_clone = resource_monitor.clone();
-    actix_rt::spawn(async move {
+    let monitor_data = web::Data::new(resource_monitor.clone());
+    let config_data = web::Data::new(config.clone());
+
+    actix_web::rt::spawn(async move {
         loop {
-            if let Err(why) = resource_monitor_clone.lock().await.refresh().await {
+            if let Err(why) = resource_monitor.lock().await.refresh().await {
                 log::error!("Resource monitor refresh failed: {why}");
-            };
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
-    Server::build()
-        .bind(
-            "gated-proxy",
-            (config.host.clone(), config.port),
-            move || {
-                let config = config.clone();
-                let resource_monitor = resource_monitor.clone();
-                HttpService::build()
-                    .on_connect_ext(move |_, ext| {
-                        ext.insert(config.clone());
-                        ext.insert(resource_monitor.clone());
-                    })
-                    .finish(|mut req: Request| async move {
-                        log::debug!("New request: {req:?}");
-                        let resource_monitor =
-                            req.conn_data::<Arc<Mutex<ResourceMonitor>>>().unwrap();
-                        let api_allowed = match resource_monitor.lock().await.api_allowed().await {
-                            Ok(val) => val,
-                            Err(why) => {
-                                log::error!("Resource monitor reported an error, failing open: {why}");
-                                true
-                            },
-                        };
-                        if api_allowed {
-                            let config = req.conn_data::<Arc<Config>>().unwrap().clone();
-                            let client = Client::new();
-
-                            let mut body = BytesMut::new();
-
-                            while let Some(chunk) = req.payload().next().await {
-                                body.extend_from_slice(&chunk?);
-                            }
-
-                            let mut upstream_res = client
-                                .request_from(
-                                    format!(
-                                        "http://{}:{}{}",
-                                        config.target_host,
-                                        config.target_port,
-                                        req.uri()
-                                    ),
-                                    req.head(),
-                                )
-                                .send_body(body)
-                                .await.unwrap();
-                            let status = upstream_res.status();
-                            let headers = upstream_res.headers().clone();
-                            let mut upstream_body = BytesMut::new();
-                            while let Some(chunk) = upstream_res.next().await {
-                                upstream_body.extend(&chunk?);
-                            }
-
-                            let mut res = Response::new(status).set_body(upstream_body.freeze());
-                            log::debug!("Dispatching response: {res:?}");
-                            res.headers_mut().clear();
-                            for (name, value) in headers {
-                                res.headers_mut().append(name, value);
-                            }
-                            Ok::<_, actix_http::Error>(res)
-                        } else {
-                            log::info!("Resource use too high! Sending 503");
-                            let mut res = Response::new(StatusCode::SERVICE_UNAVAILABLE);
-                            res.headers_mut().insert(
-                                HeaderName::from_static("retry-after"),
-                                HeaderValue::from_static("10"),
-                            );
-                            res.headers_mut().insert(
-                                HeaderName::from_static("content-type"),
-                                HeaderValue::from_static("application/json"),
-                            );
-
-                            let data = Bytes::from_static(r#"{"error":{"message":"Resource load too high, try again later","type":"overloaded","code":"resource_exhausted"}}"#.as_bytes());
-
-                            Ok::<_, actix_http::Error>(res.set_body(data))
-                        }
-                    })
-                    .tcp()
-            },
-        )?
-        .run()
-        .await
+    HttpServer::new(move || {
+        App::new()
+            .wrap(Logger::default())
+            .app_data(monitor_data.clone())
+            .app_data(config_data.clone())
+            .app_data(PayloadConfig::new(100 * 1024 * 1024)) // 100 MB, the same as llama.cpp
+            .default_service(web::to(proxy_handler))
+    })
+    .bind((config.host, config.port))?
+    .run()
+    .await
 }
