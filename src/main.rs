@@ -146,7 +146,7 @@ impl ResourceMonitor {
 }
 
 async fn proxy_handler(
-    resource_monitor: web::Data<Arc<Mutex<ResourceMonitor>>>,
+    resource_monitor: web::Data<Mutex<ResourceMonitor>>,
     config: web::Data<Config>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
@@ -162,10 +162,10 @@ async fn proxy_handler(
     if !api_allowed {
         log::info!("Proxied request disallowed due to system conditions");
         return Ok(HttpResponse::ServiceUnavailable()
-            .insert_header(("retry-after", "10"))
+            .insert_header(("retry-after", "120"))
             .insert_header(("content-type", "application/json"))
             .body(
-                r#"{"error":{"message":"Resource load too high, try again later","type":"overloaded","code":503}}"#
+                r#"{"error":{"message":"Resource load too high, try again later","type":"rate_limit_error","code":"resource_exhausted"}}"#
                     .to_string(),
             ));
     }
@@ -210,14 +210,14 @@ async fn main() -> io::Result<()> {
         std::env::var("GATED_PROXY_CONFIG").unwrap_or_else(|_| "config.json".to_string());
     let config: Config = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
 
-    let resource_monitor = Arc::new(Mutex::new(ResourceMonitor::new(config.clone())));
+    let resource_monitor = web::Data::new(Mutex::new(ResourceMonitor::new(config.clone())));
+    let resource_monitor_clone = resource_monitor.clone();
 
-    let monitor_data = web::Data::new(resource_monitor.clone());
     let config_data = web::Data::new(config.clone());
 
     actix_web::rt::spawn(async move {
         loop {
-            if let Err(why) = resource_monitor.lock().await.refresh().await {
+            if let Err(why) = resource_monitor_clone.lock().await.refresh().await {
                 log::error!("Resource monitor refresh failed: {why}");
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -227,7 +227,7 @@ async fn main() -> io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
-            .app_data(monitor_data.clone())
+            .app_data(resource_monitor.clone())
             .app_data(config_data.clone())
             .app_data(PayloadConfig::new(100 * 1024 * 1024)) // 100 MB, the same as llama.cpp
             .default_service(web::to(proxy_handler))
