@@ -1,14 +1,24 @@
-use std::{fs, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use awc::Client;
-use serde::Deserialize;
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 
 use actix_web::{
-    App, HttpResponse, HttpServer, error,
+    App, HttpMessage, HttpResponse, HttpServer, error, get,
     middleware::Logger,
-    web::{self, PayloadConfig},
+    web::{self, Bytes, BytesMut, Data, Path, PayloadConfig},
 };
 
 #[derive(Deserialize)]
@@ -57,10 +67,52 @@ struct ResourceMonitor {
     config: Config,
     sys: System,
     refresh_kind: RefreshKind,
-    last_under_load: Option<tokio::time::Instant>,
-    last_model_loaded: Option<tokio::time::Instant>,
+    last_under_load: Option<Instant>,
+    last_model_loaded: Option<Instant>,
     vram_path: PathBuf,
     total_vram: u64,
+}
+
+struct Telemetry {
+    requests: HashMap<u64, Arc<std::sync::RwLock<TelemetryRequest>>>,
+    next_id: u64,
+}
+
+#[derive(Serialize)]
+struct TelemetryRequest {
+    cc_request: ChatCompletionsRequest,
+    reasoning: String,
+    content: String,
+    timestamp: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChatCompletionsRequest {
+    model: String,
+    messages: Vec<ChatCompletionMessage>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChatCompletionMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChatCompletionsChunk {
+    choices: Vec<ChatCompletionsChunkChoices>,
+    created: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChatCompletionsChunkChoices {
+    delta: ChatCompletionsChunkDelta,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ChatCompletionsChunkDelta {
+    reasoning_content: Option<String>,
+    content: Option<String>,
 }
 
 impl ResourceMonitor {
@@ -95,10 +147,11 @@ impl ResourceMonitor {
         let vram: u64 = fs::read_to_string(&self.vram_path)?.trim().parse()?;
 
         let vram_used = vram as f64 / self.total_vram as f64;
+        // TODO: figure out what `used_memory` actually entails
         let ram_used = self.sys.used_memory() as f64 / self.sys.total_memory() as f64;
 
         if vram_used > self.config.vram_thresh || ram_used > self.config.ram_thresh {
-            self.last_under_load = Some(tokio::time::Instant::now());
+            self.last_under_load = Some(Instant::now());
         }
 
         let client = Client::new();
@@ -117,7 +170,7 @@ impl ResourceMonitor {
             model.status.value == ModelStatusValue::Loaded
                 || model.status.value == ModelStatusValue::Loading
         }) {
-            self.last_model_loaded = Some(tokio::time::Instant::now());
+            self.last_model_loaded = Some(Instant::now());
         }
 
         Ok(())
@@ -145,9 +198,59 @@ impl ResourceMonitor {
     }
 }
 
+impl Telemetry {
+    fn new() -> Self {
+        Self {
+            requests: HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    fn new_request(
+        &mut self,
+        cc_request: ChatCompletionsRequest,
+    ) -> Arc<std::sync::RwLock<TelemetryRequest>> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let request = Arc::new(std::sync::RwLock::new(TelemetryRequest {
+            cc_request,
+            reasoning: String::new(),
+            content: String::new(),
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }));
+        self.requests.insert(id, request.clone());
+
+        request
+    }
+
+    /// Cleanup old requests
+    async fn cleanup(&mut self) {
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut to_delete = Vec::new();
+        for (id, request) in &self.requests {
+            // FIXME: Configurable
+            if timestamp.saturating_sub(request.read().unwrap().timestamp) > 3600 {
+                to_delete.push(*id);
+            }
+        }
+
+        for id in to_delete {
+            self.requests.remove(&id);
+        }
+    }
+}
+
 async fn proxy_handler(
-    resource_monitor: web::Data<Mutex<ResourceMonitor>>,
-    config: web::Data<Config>,
+    resource_monitor: Data<Mutex<ResourceMonitor>>,
+    telemetry: Data<RwLock<Telemetry>>,
+    config: Data<Config>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -178,10 +281,13 @@ async fn proxy_handler(
         req.uri()
     );
 
+    log::trace!("body: {}", String::from_utf8_lossy(&body));
+
     match client
         .request_from(&upstream_url, req.head())
         .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
-        .send_body(body)
+        .no_decompress()
+        .send_body(body.clone())
         .await
     {
         Ok(upstream_res) => {
@@ -189,7 +295,45 @@ async fn proxy_handler(
             // let stream = BodyStream::new(upstream_res.take_payload());
             let headers = upstream_res.headers().clone();
 
-            let mut res = HttpResponse::build(upstream_res.status()).streaming(upstream_res);
+            // If the body parses successfully as an OpenAI Chat Completions request, start doing telemetry on it
+            let mut res = if let Ok(cc_request) =
+                serde_json::from_slice::<ChatCompletionsRequest>(&body)
+            {
+                log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
+                let request = telemetry.write().await.new_request(cc_request);
+
+                HttpResponse::build(upstream_res.status()).streaming(upstream_res.inspect(
+                    move |res| {
+                        if let Ok(data) = res {
+                            let string = String::from_utf8_lossy(data);
+                            let chunk = string.splitn(2, ":").last().unwrap();
+                            log::trace!("chunk: {chunk}");
+                            match serde_json::from_str::<ChatCompletionsChunk>(chunk) {
+                                Ok(chunk) => {
+                                    let mut request = request.write().unwrap();
+
+                                    request.timestamp = chunk.created;
+
+                                    for choice in chunk.choices {
+                                        if let Some(reasoning) = choice.delta.reasoning_content {
+                                            request.reasoning.push_str(&reasoning);
+                                        }
+                                        if let Some(content) = choice.delta.content {
+                                            request.content.push_str(&content);
+                                        }
+                                    }
+                                }
+                                Err(why) => {
+                                    log::error!("Failed to parse chunk: {why}");
+                                }
+                            };
+                        }
+                    },
+                ))
+            } else {
+                HttpResponse::build(upstream_res.status()).streaming(upstream_res)
+            };
+
             for (name, value) in headers {
                 res.headers_mut().insert(name, value);
             }
@@ -202,6 +346,20 @@ async fn proxy_handler(
     }
 }
 
+#[get("/telemetry/{id}")]
+async fn telemetry_request(
+    telemetry: Data<RwLock<Telemetry>>,
+    id: Path<u64>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let telemetry = telemetry.read().await;
+    let request = telemetry
+        .requests
+        .get(&id)
+        .ok_or(error::ErrorNotFound("No request with such ID exists"))?;
+
+    Ok(HttpResponse::Ok().json(&*request.read().unwrap()))
+}
+
 #[actix_web::main]
 async fn main() -> io::Result<()> {
     env_logger::init();
@@ -210,16 +368,20 @@ async fn main() -> io::Result<()> {
         std::env::var("GATED_PROXY_CONFIG").unwrap_or_else(|_| "config.json".to_string());
     let config: Config = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
 
-    let resource_monitor = web::Data::new(Mutex::new(ResourceMonitor::new(config.clone())));
+    let resource_monitor = Data::new(Mutex::new(ResourceMonitor::new(config.clone())));
     let resource_monitor_clone = resource_monitor.clone();
 
-    let config_data = web::Data::new(config.clone());
+    let telemetry = Data::new(RwLock::new(Telemetry::new()));
+    let telemetry_clone = telemetry.clone();
+
+    let config_data = Data::new(config.clone());
 
     actix_web::rt::spawn(async move {
         loop {
             if let Err(why) = resource_monitor_clone.lock().await.refresh().await {
                 log::error!("Resource monitor refresh failed: {why}");
             }
+            telemetry_clone.write().await.cleanup().await;
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
@@ -228,8 +390,10 @@ async fn main() -> io::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(resource_monitor.clone())
+            .app_data(telemetry.clone())
             .app_data(config_data.clone())
             .app_data(PayloadConfig::new(100 * 1024 * 1024)) // 100 MB, the same as llama.cpp
+            .service(telemetry_request)
             .default_service(web::to(proxy_handler))
     })
     .bind((config.host, config.port))?
