@@ -7,8 +7,9 @@ use std::{
 };
 
 use awc::Client;
-use futures_util::{FutureExt, StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use sse_core::{SseDecoder, SseEvent::Message};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::{
     sync::{Mutex, RwLock},
@@ -16,9 +17,9 @@ use tokio::{
 };
 
 use actix_web::{
-    App, HttpMessage, HttpResponse, HttpServer, error, get,
+    App, HttpResponse, HttpServer, error, get,
     middleware::Logger,
-    web::{self, Bytes, BytesMut, Data, Path, PayloadConfig},
+    web::{self, BytesMut, Data, Path, PayloadConfig},
 };
 
 #[derive(Deserialize)]
@@ -61,6 +62,20 @@ struct Config {
     idle_thresh: u64,
 
     gpu_sysfs_path: PathBuf,
+
+    /// Whether to enable haywire detection (repeated token patterns)
+    #[serde(default)]
+    haywire_detection_enabled: bool,
+
+    /// Minimum number of consecutive identical characters before flagging as haywire
+    #[serde(default = "Config::default_haywire_char_repeats")]
+    haywire_char_repeats: usize,
+}
+
+impl Config {
+    fn default_haywire_char_repeats() -> usize {
+        40
+    }
 }
 
 struct ResourceMonitor {
@@ -78,21 +93,57 @@ struct Telemetry {
     next_id: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct TelemetryRequest {
     cc_request: ChatCompletionsRequest,
     reasoning: String,
     content: String,
     timestamp: u64,
+    haywire_detected: bool,
 }
 
-#[derive(Deserialize, Serialize)]
+struct HaywireDetector {
+    char_repeats: usize,
+}
+
+impl HaywireDetector {
+    fn new(char_repeats: usize) -> Self {
+        Self { char_repeats }
+    }
+
+    /// Check if the accumulated content indicates haywire behavior.
+    /// Returns true if a repeated pattern is detected.
+    fn check_haywire(&self, text: &str) -> bool {
+        if text.len() < self.char_repeats {
+            return false;
+        }
+
+        // Check for single character repetition (e.g., "//////////////")
+        let mut count = 1usize;
+        let mut haywire = false;
+        for window in text.chars().collect::<Vec<_>>().windows(2) {
+            if window[0] == window[1] {
+                count += 1;
+                if count >= self.char_repeats {
+                    haywire = true;
+                    break;
+                }
+            } else {
+                count = 1;
+            }
+        }
+
+        haywire
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 struct ChatCompletionsRequest {
     model: String,
     messages: Vec<ChatCompletionMessage>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct ChatCompletionMessage {
     role: String,
     content: String,
@@ -221,6 +272,7 @@ impl Telemetry {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            haywire_detected: false,
         }));
         self.requests.insert(id, request.clone());
 
@@ -266,11 +318,13 @@ async fn proxy_handler(
         log::info!("Proxied request disallowed due to system conditions");
         return Ok(HttpResponse::ServiceUnavailable()
             .insert_header(("retry-after", "120"))
-            .insert_header(("content-type", "application/json"))
-            .body(
-                r#"{"error":{"message":"Resource load too high, try again later","type":"rate_limit_error","code":"resource_exhausted"}}"#
-                    .to_string(),
-            ));
+            .json(serde_json::json!({
+                "error": {
+                    "message": "Resource load too high, try again later",
+                    "type": "rate_limit_error",
+                    "code": "resource_exhausted"
+                }
+            })));
     }
 
     let client = Client::new();
@@ -292,47 +346,126 @@ async fn proxy_handler(
     {
         Ok(upstream_res) => {
             log::info!("Dispatching response: status={}", upstream_res.status());
-            // let stream = BodyStream::new(upstream_res.take_payload());
             let headers = upstream_res.headers().clone();
 
             // If the body parses successfully as an OpenAI Chat Completions request, start doing telemetry on it
-            let mut res = if let Ok(cc_request) =
-                serde_json::from_slice::<ChatCompletionsRequest>(&body)
-            {
-                log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
-                let request = telemetry.write().await.new_request(cc_request);
+            let mut res =
+                if let Ok(cc_request) = serde_json::from_slice::<ChatCompletionsRequest>(&body) {
+                    log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
 
-                HttpResponse::build(upstream_res.status()).streaming(upstream_res.inspect(
-                    move |res| {
+                    // Set up haywire detector if enabled and config is available
+                    let haywire_detector = if config.haywire_detection_enabled {
+                        log::info!(
+                            "Haywire detection enabled: char_repeats={}",
+                            config.haywire_char_repeats,
+                        );
+                        Some(HaywireDetector::new(config.haywire_char_repeats))
+                    } else {
+                        None
+                    };
+
+                    let request = telemetry.write().await.new_request(cc_request.clone());
+                    let request_clone = request.clone();
+                    let target_host = config.target_host.clone();
+                    let target_port = config.target_port;
+                    let model_name = cc_request.model.clone();
+                    let mut buffer = BytesMut::new();
+                    let mut decoder = SseDecoder::new();
+
+                    HttpResponse::build(upstream_res.status())
+                        .streaming(upstream_res.inspect(move |res| {
                         if let Ok(data) = res {
-                            let string = String::from_utf8_lossy(data);
-                            let chunk = string.splitn(2, ":").last().unwrap();
-                            log::trace!("chunk: {chunk}");
-                            match serde_json::from_str::<ChatCompletionsChunk>(chunk) {
-                                Ok(chunk) => {
-                                    let mut request = request.write().unwrap();
+                            buffer.extend(data);
 
-                                    request.timestamp = chunk.created;
+                            while let Some(event) = decoder.next(&mut buffer) {
+                                let Ok(event) = event else {
+                                    log::error!("Stream parse error: {event:?}");
+                                    return;
+                                };
+                                let Message(msg) = event else {
+                                    log::error!("Unexpected SSE event: {event:?}");
+                                    return;
+                                };
 
-                                    for choice in chunk.choices {
-                                        if let Some(reasoning) = choice.delta.reasoning_content {
-                                            request.reasoning.push_str(&reasoning);
+                                // Break out on the stream ending message
+                                if &msg.data == "[DONE]" {
+                                    continue;
+                                }
+
+                                match serde_json::from_str::<ChatCompletionsChunk>(&msg.data) {
+                                    Ok(chunk) => {
+                                        let mut request = request_clone.write().unwrap();
+
+                                        request.timestamp = chunk.created;
+
+                                        for choice in chunk.choices {
+                                            if let Some(reasoning) = choice.delta.reasoning_content
+                                            {
+                                                request.reasoning.push_str(&reasoning);
+                                            }
+                                            if let Some(content) = choice.delta.content {
+                                                request.content.push_str(&content);
+                                            }
                                         }
-                                        if let Some(content) = choice.delta.content {
-                                            request.content.push_str(&content);
+
+                                        // Check for haywire behavior if detector is enabled and not already detected
+                                        if let Some(detector) = &haywire_detector
+                                            && !request.haywire_detected
+                                            && (detector.check_haywire(&request.content)
+                                                || detector.check_haywire(&request.reasoning))
+                                        {
+                                            request.haywire_detected = true;
+                                            log::error!(
+                                                "Haywire detected for model '{}', unloading",
+                                                model_name
+                                            );
+
+                                            // Unload the model asynchronously in background task
+                                            let target_host_clone = target_host.clone();
+                                            let target_port_clone = target_port;
+                                            let model_name_clone = model_name.clone();
+                                            actix_web::rt::spawn(async move {
+                                                let client = Client::new();
+                                                if let Err(e) = client
+                                                    .post(format!(
+                                                        "http://{}:{}/models/unload",
+                                                        target_host_clone, target_port_clone
+                                                    ))
+                                                    .timeout(Duration::from_secs(30))
+                                                    .insert_header((
+                                                        "content-type",
+                                                        "application/json",
+                                                    ))
+                                                    .send_json(&serde_json::json!({
+                                                        "model": model_name_clone
+                                                    }))
+                                                    .await
+                                                {
+                                                    log::error!(
+                                                        "Failed to unload haywire model '{}': {}",
+                                                        model_name_clone,
+                                                        e
+                                                    );
+                                                } else {
+                                                    log::info!(
+                                                        "Successfully unloaded haywire model '{}'",
+                                                        model_name_clone
+                                                    );
+                                                }
+                                            });
                                         }
                                     }
+                                    Err(why) => {
+                                        log::error!("Failed to parse chunk: {why}");
+                                        log::info!("chunk: {}", msg.data);
+                                    }
                                 }
-                                Err(why) => {
-                                    log::error!("Failed to parse chunk: {why}");
-                                }
-                            };
+                            }
                         }
-                    },
-                ))
-            } else {
-                HttpResponse::build(upstream_res.status()).streaming(upstream_res)
-            };
+                    }))
+                } else {
+                    HttpResponse::build(upstream_res.status()).streaming(upstream_res)
+                };
 
             for (name, value) in headers {
                 res.headers_mut().insert(name, value);
@@ -347,7 +480,7 @@ async fn proxy_handler(
 }
 
 #[get("/telemetry/{id}")]
-async fn telemetry_request(
+async fn telemetry_request_json(
     telemetry: Data<RwLock<Telemetry>>,
     id: Path<u64>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -393,7 +526,7 @@ async fn main() -> io::Result<()> {
             .app_data(telemetry.clone())
             .app_data(config_data.clone())
             .app_data(PayloadConfig::new(100 * 1024 * 1024)) // 100 MB, the same as llama.cpp
-            .service(telemetry_request)
+            .service(telemetry_request_json)
             .default_service(web::to(proxy_handler))
     })
     .bind((config.host, config.port))?
