@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs, io,
     path::PathBuf,
-    sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
+use all_smi::AllSmi;
 use awc::Client;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ use actix_web::{
     web::{self, BytesMut, Data, Path, PayloadConfig},
 };
 
+mod telemetry;
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<Model>,
@@ -29,6 +31,7 @@ struct ModelsResponse {
 
 #[derive(Deserialize)]
 struct Model {
+    id: String,
     status: ModelStatus,
 }
 
@@ -53,15 +56,16 @@ struct Config {
     target_host: String,
     target_port: u16,
 
-    /// What percentage of RAM the current usage should be under
-    ram_thresh: f64,
-    /// What percentage of VRAM the current usage should be under
-    vram_thresh: f64,
-    /// How long the system should have been "idling" for based on the other
-    /// thresholds
-    idle_thresh: u64,
+    /// Which GPU to use
+    gpu: String,
 
-    gpu_sysfs_path: PathBuf,
+    /// How long in seconds the load average window is
+    load_average_window: usize,
+
+    cpu_load_average_thresh: f64,
+    gpu_load_average_thresh: f64,
+
+    model_loaded_grace: u64,
 
     /// Whether to enable haywire detection (repeated token patterns)
     #[serde(default)]
@@ -70,6 +74,9 @@ struct Config {
     /// Minimum number of consecutive identical characters before flagging as haywire
     #[serde(default = "Config::default_haywire_char_repeats")]
     haywire_char_repeats: usize,
+
+    idle_unload_timeouts: HashMap<String, u64>,
+    default_unload_timeout: u64,
 }
 
 impl Config {
@@ -80,61 +87,12 @@ impl Config {
 
 struct ResourceMonitor {
     config: Config,
-    sys: System,
-    refresh_kind: RefreshKind,
-    last_under_load: Option<Instant>,
+    smi: AllSmi,
+    cpu_load_samples: VecDeque<f64>,
+    gpu_load_samples: VecDeque<f64>,
     last_model_loaded: Option<Instant>,
-    vram_path: PathBuf,
-    total_vram: u64,
-}
-
-struct Telemetry {
-    requests: HashMap<u64, Arc<std::sync::RwLock<TelemetryRequest>>>,
-    next_id: u64,
-}
-
-#[derive(Serialize, Clone)]
-struct TelemetryRequest {
-    cc_request: ChatCompletionsRequest,
-    reasoning: String,
-    content: String,
-    timestamp: u64,
-    haywire_detected: bool,
-}
-
-struct HaywireDetector {
-    char_repeats: usize,
-}
-
-impl HaywireDetector {
-    fn new(char_repeats: usize) -> Self {
-        Self { char_repeats }
-    }
-
-    /// Check if the accumulated content indicates haywire behavior.
-    /// Returns true if a repeated pattern is detected.
-    fn check_haywire(&self, text: &str) -> bool {
-        if text.len() < self.char_repeats {
-            return false;
-        }
-
-        // Check for single character repetition (e.g., "//////////////")
-        let mut count = 1usize;
-        let mut haywire = false;
-        for window in text.chars().collect::<Vec<_>>().windows(2) {
-            if window[0] == window[1] {
-                count += 1;
-                if count >= self.char_repeats {
-                    haywire = true;
-                    break;
-                }
-            } else {
-                count = 1;
-            }
-        }
-
-        haywire
-    }
+    /// Monitor when models have been active to unload when idle for a long enough time
+    models_last_active: HashMap<String, Instant>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -149,61 +107,83 @@ struct ChatCompletionMessage {
     content: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ChatCompletionsChunk {
     choices: Vec<ChatCompletionsChunkChoices>,
     created: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ChatCompletionsChunkChoices {
-    delta: ChatCompletionsChunkDelta,
+    delta: Option<ChatCompletionsChunkDelta>,
+    message: Option<ChatCompletionsMessage>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct ChatCompletionsChunkDelta {
     reasoning_content: Option<String>,
     content: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ChatCompletionsMessage {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Slot {
+    is_processing: bool,
+}
+
 impl ResourceMonitor {
-    fn new(config: Config) -> Self {
-        let refresh_kind = RefreshKind::nothing().with_memory(MemoryRefreshKind::everything());
-        let sys = System::new_with_specifics(refresh_kind);
-        let mut total_vram_path = config.gpu_sysfs_path.clone();
-        let mut vram_path = config.gpu_sysfs_path.clone();
+    fn new(config: Config) -> Result<Self, Box<dyn std::error::Error>> {
+        let smi = AllSmi::new()?;
 
-        total_vram_path.extend(&["mem_info_vram_total"]);
-        vram_path.extend(&["mem_info_vram_used"]);
-
-        let total_vram = fs::read_to_string(total_vram_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-
-        Self {
+        Ok(Self {
+            // Initialize with zeroes to allow everything at first
+            cpu_load_samples: vec![0.0; config.load_average_window].into(),
+            gpu_load_samples: vec![0.0; config.load_average_window].into(),
             config,
-            sys,
-            refresh_kind,
-            last_under_load: None,
+            smi,
+            // sys,
+            // refresh_kind,
+            // last_under_load: None,
             last_model_loaded: None,
-            total_vram,
-            vram_path,
-        }
+            // total_vram,
+            // vram_path,
+            models_last_active: HashMap::new(),
+        })
     }
 
     async fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.sys.refresh_specifics(self.refresh_kind);
-        let vram: u64 = fs::read_to_string(&self.vram_path)?.trim().parse()?;
+        if let Some(gpu) = self
+            .smi
+            .get_gpu_info()
+            .into_iter()
+            .find(|gpu| gpu.name == self.config.gpu)
+        {
+            self.gpu_load_samples.push_back(gpu.utilization);
 
-        let vram_used = vram as f64 / self.total_vram as f64;
-        // TODO: figure out what `used_memory` actually entails
-        let ram_used = self.sys.used_memory() as f64 / self.sys.total_memory() as f64;
-
-        if vram_used > self.config.vram_thresh || ram_used > self.config.ram_thresh {
-            self.last_under_load = Some(Instant::now());
+            if self.gpu_load_samples.len() > self.config.load_average_window {
+                self.gpu_load_samples.pop_front();
+            }
+        } else {
+            log::warn!("Named GPU not found, failing open");
         }
+
+        let cpu = self.smi.get_cpu_info().pop().unwrap();
+
+        self.cpu_load_samples.push_back(cpu.utilization);
+
+        if self.cpu_load_samples.len() > self.config.load_average_window {
+            self.cpu_load_samples.pop_front();
+        }
+
+        log::trace!(
+            "Load averages: CPU {:.2}%, GPU {:.2}%",
+            self.cpu_load_samples.iter().sum::<f64>() / self.cpu_load_samples.len() as f64,
+            self.gpu_load_samples.iter().sum::<f64>() / self.gpu_load_samples.len() as f64
+        );
 
         let client = Client::new();
         let models: ModelsResponse = client
@@ -217,11 +197,55 @@ impl ResourceMonitor {
             .json()
             .await?;
 
-        if models.data.iter().any(|model| {
-            model.status.value == ModelStatusValue::Loaded
+        for model in models.data {
+            if model.status.value == ModelStatusValue::Loaded
                 || model.status.value == ModelStatusValue::Loading
-        }) {
-            self.last_model_loaded = Some(Instant::now());
+            {
+                self.last_model_loaded = Some(Instant::now());
+            }
+
+            // Only query slots if the model is loaded since otherwise it would wake the model
+            if model.status.value == ModelStatusValue::Loaded
+                && let Ok(slots) = client
+                    .get(format!(
+                        "http://{}:{}/slots?model={}",
+                        self.config.target_host, self.config.target_port, model.id
+                    ))
+                    .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
+                    .send()
+                    .await?
+                    .json::<Vec<Slot>>()
+                    .await
+            {
+                // When the model has just been loaded, there is no entry in the hashmap
+                if !self.models_last_active.contains_key(&model.id) {
+                    self.models_last_active
+                        .insert(model.id.clone(), Instant::now());
+                }
+
+                if slots.iter().any(|slot| slot.is_processing) {
+                    self.models_last_active.insert(model.id, Instant::now());
+                }
+            }
+
+            let mut to_unload = Vec::new();
+
+            for (model, last_active) in &self.models_last_active {
+                let timeout = self
+                    .config
+                    .idle_unload_timeouts
+                    .get(model)
+                    .unwrap_or(&self.config.default_unload_timeout);
+
+                if last_active.elapsed().as_secs() > *timeout {
+                    to_unload.push(model.clone());
+                }
+            }
+
+            for model in to_unload {
+                unload_model(&self.config.target_host, self.config.target_port, &model).await?;
+                self.models_last_active.remove(&model);
+            }
         }
 
         Ok(())
@@ -230,16 +254,19 @@ impl ResourceMonitor {
     async fn api_allowed(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
         self.refresh().await?;
 
-        let load_allowed = self
-            .last_under_load
-            .map(|instant| instant.elapsed().as_secs())
-            .unwrap_or(u64::MAX)
-            > self.config.idle_thresh;
+        let cpu_average =
+            self.cpu_load_samples.iter().sum::<f64>() / self.cpu_load_samples.len() as f64;
+        let gpu_average =
+            self.gpu_load_samples.iter().sum::<f64>() / self.gpu_load_samples.len() as f64;
+
+        let load_allowed = cpu_average < self.config.cpu_load_average_thresh
+            && gpu_average < self.config.gpu_load_average_thresh;
+
         let grace_allowed = self
             .last_model_loaded
             .map(|instant| instant.elapsed().as_secs())
             .unwrap_or(u64::MAX)
-            < self.config.idle_thresh;
+            < self.config.model_loaded_grace;
 
         log::debug!("Load allowed: {load_allowed}, grace allowed: {grace_allowed}");
         // Allow API queries if either:
@@ -249,59 +276,31 @@ impl ResourceMonitor {
     }
 }
 
-impl Telemetry {
-    fn new() -> Self {
-        Self {
-            requests: HashMap::new(),
-            next_id: 0,
-        }
-    }
+async fn unload_model(
+    target_host: &str,
+    target_port: u16,
+    model: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new();
 
-    fn new_request(
-        &mut self,
-        cc_request: ChatCompletionsRequest,
-    ) -> Arc<std::sync::RwLock<TelemetryRequest>> {
-        let id = self.next_id;
-        self.next_id += 1;
+    client
+        .post(format!(
+            "http://{}:{}/models/unload",
+            target_host, target_port
+        ))
+        .timeout(Duration::from_secs(30))
+        .insert_header(("content-type", "application/json"))
+        .send_json(&serde_json::json!({
+            "model": model
+        }))
+        .await?;
 
-        let request = Arc::new(std::sync::RwLock::new(TelemetryRequest {
-            cc_request,
-            reasoning: String::new(),
-            content: String::new(),
-            timestamp: SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            haywire_detected: false,
-        }));
-        self.requests.insert(id, request.clone());
-
-        request
-    }
-
-    /// Cleanup old requests
-    async fn cleanup(&mut self) {
-        let timestamp = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut to_delete = Vec::new();
-        for (id, request) in &self.requests {
-            // FIXME: Configurable
-            if timestamp.saturating_sub(request.read().unwrap().timestamp) > 3600 {
-                to_delete.push(*id);
-            }
-        }
-
-        for id in to_delete {
-            self.requests.remove(&id);
-        }
-    }
+    Ok(())
 }
 
 async fn proxy_handler(
     resource_monitor: Data<Mutex<ResourceMonitor>>,
-    telemetry: Data<RwLock<Telemetry>>,
+    telemetry: Data<RwLock<telemetry::Telemetry>>,
     config: Data<Config>,
     req: actix_web::HttpRequest,
     body: web::Bytes,
@@ -344,128 +343,113 @@ async fn proxy_handler(
         .send_body(body.clone())
         .await
     {
-        Ok(upstream_res) => {
+        Ok(mut upstream_res) => {
             log::info!("Dispatching response: status={}", upstream_res.status());
             let headers = upstream_res.headers().clone();
 
             // If the body parses successfully as an OpenAI Chat Completions request, start doing telemetry on it
-            let mut res =
-                if let Ok(cc_request) = serde_json::from_slice::<ChatCompletionsRequest>(&body) {
-                    log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
+            let mut res = if let Ok(cc_request) =
+                serde_json::from_slice::<ChatCompletionsRequest>(&body)
+            {
+                log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
 
-                    // Set up haywire detector if enabled and config is available
-                    let haywire_detector = if config.haywire_detection_enabled {
-                        log::info!(
-                            "Haywire detection enabled: char_repeats={}",
-                            config.haywire_char_repeats,
-                        );
-                        Some(HaywireDetector::new(config.haywire_char_repeats))
-                    } else {
-                        None
-                    };
+                let is_streaming = upstream_res
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.contains("text/event-stream"))
+                    .unwrap_or(false);
 
-                    let request = telemetry.write().await.new_request(cc_request.clone());
+                // Set up haywire detector if enabled and config is available
+                let haywire_detector = if config.haywire_detection_enabled {
+                    log::info!(
+                        "Haywire detection enabled: char_repeats={}",
+                        config.haywire_char_repeats,
+                    );
+                    Some(telemetry::HaywireDetector::new(config.haywire_char_repeats))
+                } else {
+                    None
+                };
+
+                let request = telemetry.write().await.new_request(cc_request.clone());
+                let target_host = config.target_host.clone();
+                let target_port = config.target_port;
+                let model_name = cc_request.model.clone();
+
+                if is_streaming {
                     let request_clone = request.clone();
-                    let target_host = config.target_host.clone();
-                    let target_port = config.target_port;
-                    let model_name = cc_request.model.clone();
                     let mut buffer = BytesMut::new();
                     let mut decoder = SseDecoder::new();
 
-                    HttpResponse::build(upstream_res.status())
-                        .streaming(upstream_res.inspect(move |res| {
-                        if let Ok(data) = res {
-                            buffer.extend(data);
+                    HttpResponse::build(upstream_res.status()).streaming(upstream_res.inspect(
+                        move |res| {
+                            if let Ok(data) = res {
+                                buffer.extend(data);
 
-                            while let Some(event) = decoder.next(&mut buffer) {
-                                let Ok(event) = event else {
-                                    log::error!("Stream parse error: {event:?}");
-                                    return;
-                                };
-                                let Message(msg) = event else {
-                                    log::error!("Unexpected SSE event: {event:?}");
-                                    return;
-                                };
+                                while let Some(event) = decoder.next(&mut buffer) {
+                                    let Ok(event) = event else {
+                                        log::error!("Stream parse error: {event:?}");
+                                        return;
+                                    };
+                                    let Message(msg) = event else {
+                                        log::error!("Unexpected SSE event: {event:?}");
+                                        return;
+                                    };
 
-                                // Break out on the stream ending message
-                                if &msg.data == "[DONE]" {
-                                    continue;
-                                }
-
-                                match serde_json::from_str::<ChatCompletionsChunk>(&msg.data) {
-                                    Ok(chunk) => {
-                                        let mut request = request_clone.write().unwrap();
-
-                                        request.timestamp = chunk.created;
-
-                                        for choice in chunk.choices {
-                                            if let Some(reasoning) = choice.delta.reasoning_content
-                                            {
-                                                request.reasoning.push_str(&reasoning);
-                                            }
-                                            if let Some(content) = choice.delta.content {
-                                                request.content.push_str(&content);
-                                            }
-                                        }
-
-                                        // Check for haywire behavior if detector is enabled and not already detected
-                                        if let Some(detector) = &haywire_detector
-                                            && !request.haywire_detected
-                                            && (detector.check_haywire(&request.content)
-                                                || detector.check_haywire(&request.reasoning))
-                                        {
-                                            request.haywire_detected = true;
-                                            log::error!(
-                                                "Haywire detected for model '{}', unloading",
-                                                model_name
-                                            );
-
-                                            // Unload the model asynchronously in background task
-                                            let target_host_clone = target_host.clone();
-                                            let target_port_clone = target_port;
-                                            let model_name_clone = model_name.clone();
-                                            actix_web::rt::spawn(async move {
-                                                let client = Client::new();
-                                                if let Err(e) = client
-                                                    .post(format!(
-                                                        "http://{}:{}/models/unload",
-                                                        target_host_clone, target_port_clone
-                                                    ))
-                                                    .timeout(Duration::from_secs(30))
-                                                    .insert_header((
-                                                        "content-type",
-                                                        "application/json",
-                                                    ))
-                                                    .send_json(&serde_json::json!({
-                                                        "model": model_name_clone
-                                                    }))
-                                                    .await
-                                                {
-                                                    log::error!(
-                                                        "Failed to unload haywire model '{}': {}",
-                                                        model_name_clone,
-                                                        e
-                                                    );
-                                                } else {
-                                                    log::info!(
-                                                        "Successfully unloaded haywire model '{}'",
-                                                        model_name_clone
-                                                    );
-                                                }
-                                            });
-                                        }
+                                    // Break out on the stream ending message
+                                    if &msg.data == "[DONE]" {
+                                        continue;
                                     }
-                                    Err(why) => {
-                                        log::error!("Failed to parse chunk: {why}");
-                                        log::info!("chunk: {}", msg.data);
+
+                                    match serde_json::from_str::<ChatCompletionsChunk>(&msg.data) {
+                                        Ok(chunk) => {
+                                            let mut req = request_clone.write().unwrap();
+                                            req.process_cc_response(
+                                                haywire_detector.as_ref(),
+                                                &model_name,
+                                                &target_host,
+                                                target_port,
+                                                chunk.created,
+                                                &chunk.choices,
+                                            );
+                                        }
+                                        Err(why) => {
+                                            log::error!("Failed to parse chunk: {why}");
+                                            log::info!("chunk: {}", msg.data);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    }))
+                        },
+                    ))
                 } else {
-                    HttpResponse::build(upstream_res.status()).streaming(upstream_res)
-                };
+                    // Non-streamed response: parse the full body as a single JSON object
+                    let response_body = upstream_res
+                        .body()
+                        .await
+                        .map_err(error::ErrorInternalServerError)?;
+                    match serde_json::from_slice::<ChatCompletionsChunk>(&response_body) {
+                        Ok(cc_response) => {
+                            let mut req = request.write().unwrap();
+                            req.process_cc_response(
+                                haywire_detector.as_ref(),
+                                &model_name,
+                                &target_host,
+                                target_port,
+                                cc_response.created,
+                                &cc_response.choices,
+                            );
+                            HttpResponse::build(upstream_res.status()).body(response_body)
+                        }
+                        Err(why) => {
+                            log::error!("Failed to parse non-streamed response: {why}");
+                            HttpResponse::build(upstream_res.status()).body(response_body)
+                        }
+                    }
+                }
+            } else {
+                HttpResponse::build(upstream_res.status()).streaming(upstream_res)
+            };
 
             for (name, value) in headers {
                 res.headers_mut().insert(name, value);
@@ -481,7 +465,7 @@ async fn proxy_handler(
 
 #[get("/telemetry/{id}")]
 async fn telemetry_request_json(
-    telemetry: Data<RwLock<Telemetry>>,
+    telemetry: Data<RwLock<telemetry::Telemetry>>,
     id: Path<u64>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let telemetry = telemetry.read().await;
@@ -501,10 +485,10 @@ async fn main() -> io::Result<()> {
         std::env::var("GATED_PROXY_CONFIG").unwrap_or_else(|_| "config.json".to_string());
     let config: Config = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
 
-    let resource_monitor = Data::new(Mutex::new(ResourceMonitor::new(config.clone())));
+    let resource_monitor = Data::new(Mutex::new(ResourceMonitor::new(config.clone()).unwrap()));
     let resource_monitor_clone = resource_monitor.clone();
 
-    let telemetry = Data::new(RwLock::new(Telemetry::new()));
+    let telemetry = Data::new(RwLock::new(telemetry::Telemetry::new()));
     let telemetry_clone = telemetry.clone();
 
     let config_data = Data::new(config.clone());

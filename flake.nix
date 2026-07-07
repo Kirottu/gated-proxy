@@ -46,6 +46,11 @@
             nativeBuildInputs = with pkgs; [
               rustc
               cargo
+              protobuf
+            ];
+
+            buildInputs = with pkgs; [
+              libdrm
             ];
 
             CARGO_BUILD_INCREMENTAL = "false";
