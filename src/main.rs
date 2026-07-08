@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs, io,
-    path::PathBuf,
     time::Duration,
 };
 
@@ -10,7 +9,6 @@ use awc::Client;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sse_core::{SseDecoder, SseEvent::Message};
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tokio::{
     sync::{Mutex, RwLock},
     time::Instant,
@@ -76,7 +74,7 @@ struct Config {
     haywire_char_repeats: usize,
 
     idle_unload_timeouts: HashMap<String, u64>,
-    default_unload_timeout: u64,
+    default_unload_timeout: Option<u64>,
 }
 
 impl Config {
@@ -179,12 +177,6 @@ impl ResourceMonitor {
             self.cpu_load_samples.pop_front();
         }
 
-        log::trace!(
-            "Load averages: CPU {:.2}%, GPU {:.2}%",
-            self.cpu_load_samples.iter().sum::<f64>() / self.cpu_load_samples.len() as f64,
-            self.gpu_load_samples.iter().sum::<f64>() / self.gpu_load_samples.len() as f64
-        );
-
         let client = Client::new();
         let models: ModelsResponse = client
             .get(format!(
@@ -204,48 +196,67 @@ impl ResourceMonitor {
                 self.last_model_loaded = Some(Instant::now());
             }
 
-            // Only query slots if the model is loaded since otherwise it would wake the model
-            if model.status.value == ModelStatusValue::Loaded
-                && let Ok(slots) = client
-                    .get(format!(
-                        "http://{}:{}/slots?model={}",
-                        self.config.target_host, self.config.target_port, model.id
-                    ))
-                    .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
-                    .send()
-                    .await?
-                    .json::<Vec<Slot>>()
-                    .await
+            if let Some(timeout) = self
+                .config
+                .idle_unload_timeouts
+                .get(&model.id)
+                .or(self.config.default_unload_timeout.as_ref())
             {
-                // When the model has just been loaded, there is no entry in the hashmap
-                if !self.models_last_active.contains_key(&model.id) {
-                    self.models_last_active
-                        .insert(model.id.clone(), Instant::now());
-                }
+                // Only query slots if the model is loaded since otherwise it would wake the model
+                if model.status.value == ModelStatusValue::Loaded
+                    && let Ok(slots) = client
+                        .get(format!(
+                            "http://{}:{}/slots?model={}",
+                            self.config.target_host, self.config.target_port, model.id
+                        ))
+                        .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
+                        .send()
+                        .await?
+                        .json::<Vec<Slot>>()
+                        .await
+                {
+                    // When the model has just been loaded, there is no entry in the hashmap
+                    if !self.models_last_active.contains_key(&model.id) {
+                        self.models_last_active
+                            .insert(model.id.clone(), Instant::now());
+                    }
 
-                if slots.iter().any(|slot| slot.is_processing) {
-                    self.models_last_active.insert(model.id, Instant::now());
+                    if slots.iter().any(|slot| slot.is_processing) {
+                        self.models_last_active
+                            .insert(model.id.clone(), Instant::now());
+                    }
+                    if self
+                        .models_last_active
+                        .get(&model.id)
+                        .unwrap()
+                        .elapsed()
+                        .as_secs()
+                        > *timeout
+                    {
+                        unload_model(&self.config.target_host, self.config.target_port, &model.id)
+                            .await?;
+                    }
                 }
             }
 
-            let mut to_unload = Vec::new();
+            // let mut to_unload = Vec::new();
 
-            for (model, last_active) in &self.models_last_active {
-                let timeout = self
-                    .config
-                    .idle_unload_timeouts
-                    .get(model)
-                    .unwrap_or(&self.config.default_unload_timeout);
+            // for (model, last_active) in &self.models_last_active {
+            //     let timeout = self
+            //         .config
+            //         .idle_unload_timeouts
+            //         .get(model)
+            //         .unwrap_or(&self.config.default_unload_timeout);
 
-                if last_active.elapsed().as_secs() > *timeout {
-                    to_unload.push(model.clone());
-                }
-            }
+            //     if last_active.elapsed().as_secs() > *timeout {
+            //         to_unload.push(model.clone());
+            //     }
+            // }
 
-            for model in to_unload {
-                unload_model(&self.config.target_host, self.config.target_port, &model).await?;
-                self.models_last_active.remove(&model);
-            }
+            // for model in to_unload {
+            //     unload_model(&self.config.target_host, self.config.target_port, &model).await?;
+            //     self.models_last_active.remove(&model);
+            // }
         }
 
         Ok(())
@@ -499,7 +510,7 @@ async fn main() -> io::Result<()> {
                 log::error!("Resource monitor refresh failed: {why}");
             }
             telemetry_clone.write().await.cleanup().await;
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
