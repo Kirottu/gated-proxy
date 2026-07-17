@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs, io,
+    process::Command,
     time::Duration,
 };
 
@@ -66,7 +67,6 @@ struct Config {
     model_loaded_grace: u64,
 
     /// Whether to enable haywire detection (repeated token patterns)
-    #[serde(default)]
     haywire_detection_enabled: bool,
 
     /// Minimum number of consecutive identical characters before flagging as haywire
@@ -75,6 +75,12 @@ struct Config {
 
     idle_unload_timeouts: HashMap<String, u64>,
     default_unload_timeout: Option<u64>,
+
+    #[serde(default)]
+    on_model_loaded: Option<String>,
+
+    #[serde(default)]
+    on_model_unloaded: Option<String>,
 }
 
 impl Config {
@@ -88,6 +94,7 @@ struct ResourceMonitor {
     smi: AllSmi,
     cpu_load_samples: VecDeque<f64>,
     gpu_load_samples: VecDeque<f64>,
+    model_currently_loaded: Option<bool>,
     last_model_loaded: Option<Instant>,
     /// Monitor when models have been active to unload when idle for a long enough time
     models_last_active: HashMap<String, Instant>,
@@ -146,6 +153,7 @@ impl ResourceMonitor {
             // sys,
             // refresh_kind,
             // last_under_load: None,
+            model_currently_loaded: None,
             last_model_loaded: None,
             // total_vram,
             // vram_path,
@@ -189,11 +197,13 @@ impl ResourceMonitor {
             .json()
             .await?;
 
+        let mut model_loaded = false;
+
         for model in models.data {
             if model.status.value == ModelStatusValue::Loaded
                 || model.status.value == ModelStatusValue::Loading
             {
-                self.last_model_loaded = Some(Instant::now());
+                model_loaded = true;
             }
 
             if let Some(timeout) = self
@@ -238,26 +248,29 @@ impl ResourceMonitor {
                     }
                 }
             }
-
-            // let mut to_unload = Vec::new();
-
-            // for (model, last_active) in &self.models_last_active {
-            //     let timeout = self
-            //         .config
-            //         .idle_unload_timeouts
-            //         .get(model)
-            //         .unwrap_or(&self.config.default_unload_timeout);
-
-            //     if last_active.elapsed().as_secs() > *timeout {
-            //         to_unload.push(model.clone());
-            //     }
-            // }
-
-            // for model in to_unload {
-            //     unload_model(&self.config.target_host, self.config.target_port, &model).await?;
-            //     self.models_last_active.remove(&model);
-            // }
         }
+
+        if model_loaded {
+            self.last_model_loaded = Some(Instant::now());
+        }
+
+        if let Some(previous_loaded) = self.model_currently_loaded {
+            let action = if model_loaded && !previous_loaded {
+                log::info!("Model loaded");
+                self.config.on_model_loaded.clone()
+            } else if !model_loaded && previous_loaded {
+                log::info!("Model unloaded");
+                self.config.on_model_unloaded.clone()
+            } else {
+                None
+            };
+
+            if let Some(action) = action {
+                Command::new("sh").arg("-c").arg(action).output().unwrap();
+            }
+        }
+
+        self.model_currently_loaded = Some(model_loaded);
 
         Ok(())
     }
