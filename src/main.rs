@@ -266,7 +266,13 @@ impl ResourceMonitor {
             };
 
             if let Some(action) = action {
-                Command::new("sh").arg("-c").arg(action).output().unwrap();
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(action)
+                    .spawn()
+                    .unwrap()
+                    .wait()
+                    .unwrap();
             }
         }
 
@@ -372,107 +378,111 @@ async fn proxy_handler(
             let headers = upstream_res.headers().clone();
 
             // If the body parses successfully as an OpenAI Chat Completions request, start doing telemetry on it
-            let mut res = if let Ok(cc_request) =
-                serde_json::from_slice::<ChatCompletionsRequest>(&body)
-            {
-                log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
+            let mut res = match serde_json::from_slice::<ChatCompletionsRequest>(&body) {
+                Ok(cc_request) => {
+                    log::info!("Starting telemetry: {}", telemetry.read().await.next_id);
 
-                let is_streaming = upstream_res
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|ct| ct.contains("text/event-stream"))
-                    .unwrap_or(false);
+                    let is_streaming = upstream_res
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.contains("text/event-stream"))
+                        .unwrap_or(false);
 
-                // Set up haywire detector if enabled and config is available
-                let haywire_detector = if config.haywire_detection_enabled {
-                    log::info!(
-                        "Haywire detection enabled: char_repeats={}",
-                        config.haywire_char_repeats,
-                    );
-                    Some(telemetry::HaywireDetector::new(config.haywire_char_repeats))
-                } else {
-                    None
-                };
+                    // Set up haywire detector if enabled and config is available
+                    let haywire_detector = if config.haywire_detection_enabled {
+                        log::info!(
+                            "Haywire detection enabled: char_repeats={}",
+                            config.haywire_char_repeats,
+                        );
+                        Some(telemetry::HaywireDetector::new(config.haywire_char_repeats))
+                    } else {
+                        None
+                    };
 
-                let request = telemetry.write().await.new_request(cc_request.clone());
-                let target_host = config.target_host.clone();
-                let target_port = config.target_port;
-                let model_name = cc_request.model.clone();
+                    let request = telemetry.write().await.new_request(cc_request.clone());
+                    let target_host = config.target_host.clone();
+                    let target_port = config.target_port;
+                    let model_name = cc_request.model.clone();
 
-                if is_streaming {
-                    let request_clone = request.clone();
-                    let mut buffer = BytesMut::new();
-                    let mut decoder = SseDecoder::new();
+                    if is_streaming {
+                        let request_clone = request.clone();
+                        let mut buffer = BytesMut::new();
+                        let mut decoder = SseDecoder::new();
 
-                    HttpResponse::build(upstream_res.status()).streaming(upstream_res.inspect(
-                        move |res| {
-                            if let Ok(data) = res {
-                                buffer.extend(data);
+                        HttpResponse::build(upstream_res.status()).streaming(upstream_res.inspect(
+                            move |res| {
+                                if let Ok(data) = res {
+                                    buffer.extend(data);
 
-                                while let Some(event) = decoder.next(&mut buffer) {
-                                    let Ok(event) = event else {
-                                        log::error!("Stream parse error: {event:?}");
-                                        return;
-                                    };
-                                    let Message(msg) = event else {
-                                        log::error!("Unexpected SSE event: {event:?}");
-                                        return;
-                                    };
+                                    while let Some(event) = decoder.next(&mut buffer) {
+                                        let Ok(event) = event else {
+                                            log::error!("Stream parse error: {event:?}");
+                                            return;
+                                        };
+                                        let Message(msg) = event else {
+                                            log::error!("Unexpected SSE event: {event:?}");
+                                            return;
+                                        };
 
-                                    // Break out on the stream ending message
-                                    if &msg.data == "[DONE]" {
-                                        continue;
-                                    }
-
-                                    match serde_json::from_str::<ChatCompletionsChunk>(&msg.data) {
-                                        Ok(chunk) => {
-                                            let mut req = request_clone.write().unwrap();
-                                            req.process_cc_response(
-                                                haywire_detector.as_ref(),
-                                                &model_name,
-                                                &target_host,
-                                                target_port,
-                                                chunk.created,
-                                                &chunk.choices,
-                                            );
+                                        // Break out on the stream ending message
+                                        if &msg.data == "[DONE]" {
+                                            continue;
                                         }
-                                        Err(why) => {
-                                            log::error!("Failed to parse chunk: {why}");
-                                            log::info!("chunk: {}", msg.data);
+
+                                        match serde_json::from_str::<ChatCompletionsChunk>(
+                                            &msg.data,
+                                        ) {
+                                            Ok(chunk) => {
+                                                let mut req = request_clone.write().unwrap();
+                                                req.process_cc_response(
+                                                    haywire_detector.as_ref(),
+                                                    &model_name,
+                                                    &target_host,
+                                                    target_port,
+                                                    chunk.created,
+                                                    &chunk.choices,
+                                                );
+                                            }
+                                            Err(why) => {
+                                                log::error!("Failed to parse chunk: {why}");
+                                                log::info!("chunk: {}", msg.data);
+                                            }
                                         }
                                     }
                                 }
+                            },
+                        ))
+                    } else {
+                        // Non-streamed response: parse the full body as a single JSON object
+                        let response_body = upstream_res
+                            .body()
+                            .await
+                            .map_err(error::ErrorInternalServerError)?;
+                        match serde_json::from_slice::<ChatCompletionsChunk>(&response_body) {
+                            Ok(cc_response) => {
+                                let mut req = request.write().unwrap();
+                                req.process_cc_response(
+                                    haywire_detector.as_ref(),
+                                    &model_name,
+                                    &target_host,
+                                    target_port,
+                                    cc_response.created,
+                                    &cc_response.choices,
+                                );
+                                HttpResponse::build(upstream_res.status()).body(response_body)
                             }
-                        },
-                    ))
-                } else {
-                    // Non-streamed response: parse the full body as a single JSON object
-                    let response_body = upstream_res
-                        .body()
-                        .await
-                        .map_err(error::ErrorInternalServerError)?;
-                    match serde_json::from_slice::<ChatCompletionsChunk>(&response_body) {
-                        Ok(cc_response) => {
-                            let mut req = request.write().unwrap();
-                            req.process_cc_response(
-                                haywire_detector.as_ref(),
-                                &model_name,
-                                &target_host,
-                                target_port,
-                                cc_response.created,
-                                &cc_response.choices,
-                            );
-                            HttpResponse::build(upstream_res.status()).body(response_body)
-                        }
-                        Err(why) => {
-                            log::error!("Failed to parse non-streamed response: {why}");
-                            HttpResponse::build(upstream_res.status()).body(response_body)
+                            Err(why) => {
+                                log::error!("Failed to parse non-streamed response: {why}");
+                                HttpResponse::build(upstream_res.status()).body(response_body)
+                            }
                         }
                     }
                 }
-            } else {
-                HttpResponse::build(upstream_res.status()).streaming(upstream_res)
+                Err(why) => {
+                    log::warn!("Failed to parse body as an OpenAI chat completions request: {why}");
+                    HttpResponse::build(upstream_res.status()).streaming(upstream_res)
+                }
             };
 
             for (name, value) in headers {
