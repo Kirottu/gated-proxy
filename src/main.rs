@@ -109,7 +109,20 @@ struct ChatCompletionsRequest {
 #[derive(Deserialize, Serialize, Clone)]
 struct ChatCompletionMessage {
     role: String,
-    content: String,
+    content: ChatCompetionsContentEnum,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(untagged)]
+enum ChatCompetionsContentEnum {
+    Plain(String),
+    List(Vec<ChatCompletionsContent>),
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct ChatCompletionsContent {
+    r#type: String,
+    text: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -364,8 +377,6 @@ async fn proxy_handler(
         req.uri()
     );
 
-    log::trace!("body: {}", String::from_utf8_lossy(&body));
-
     match client
         .request_from(&upstream_url, req.head())
         .timeout(Duration::from_secs(3600)) // llama.cpp default HTTP read write timeout
@@ -481,6 +492,7 @@ async fn proxy_handler(
                 }
                 Err(why) => {
                     log::warn!("Failed to parse body as an OpenAI chat completions request: {why}");
+                    log::trace!("{}", String::from_utf8_lossy(&body));
                     HttpResponse::build(upstream_res.status()).streaming(upstream_res)
                 }
             };
