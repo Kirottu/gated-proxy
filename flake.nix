@@ -46,12 +46,14 @@
             nativeBuildInputs = with pkgs; [
               rustc
               cargo
+              pkg-config
               protobuf
             ];
 
             buildInputs = with pkgs; [
               libdrm
               aws-lc
+              zstd.dev
             ];
 
             CARGO_BUILD_INCREMENTAL = "false";
