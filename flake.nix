@@ -51,6 +51,7 @@
 
             buildInputs = with pkgs; [
               libdrm
+              aws-lc
             ];
 
             CARGO_BUILD_INCREMENTAL = "false";
